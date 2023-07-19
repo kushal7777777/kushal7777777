@@ -1,0 +1,157 @@
+#!/bin/bash
+
+# Function to display formatted output
+print_message() {
+    echo ">> $1"
+}
+
+# Function to display error message and exit
+print_error() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# Function to check if a package is installed
+is_package_installed() {
+    dpkg -s "$1" &> /dev/null
+}
+
+# Function to check if a service is running
+is_service_running() {
+    systemctl is-active "$1" &> /dev/null
+}
+
+# Function to check and update hostname
+update_hostname() {
+    current_hostname=$(hostname)
+    target_hostname="autosrv"
+
+    if [ "$current_hostname" != "$target_hostname" ]; then
+        print_message "Updating hostname..."
+        sudo hostnamectl set-hostname "$target_hostname" || print_error "Failed to update hostname"
+        print_message "Hostname updated to $target_hostname"
+    else
+        print_message "Hostname is already set to $target_hostname"
+    fi
+}
+
+# Function to check and update network configuration
+update_network_configuration() {
+    print_message "Checking network configuration..."
+
+    # Check if network interface is available
+    interface="ens34"
+    if ! ip addr show dev "$interface" &> /dev/null; then
+        interface="ens37"
+        if ! ip addr show dev "$interface" &> /dev/null; then
+            interface="enp3s8"
+            if ! ip addr show dev "$interface" &> /dev/null; then
+                print_error "Could not find a valid network interface"
+            fi
+        fi
+    fi
+
+    # Check if IP address is set correctly
+    target_ip="192.168.16.21/24"
+    current_ip=$(ip addr show dev "$interface" | awk '/inet / {print $2}')
+
+    if [ "$current_ip" != "$target_ip" ]; then
+        print_message "Updating network configuration for interface $interface..."
+        sudo ip addr flush dev "$interface" || print_error "Failed to flush IP address"
+        sudo ip addr add "$target_ip" dev "$interface" || print_error "Failed to set IP address"
+        print_message "Network configuration updated for interface $interface"
+    else
+        print_message "Network configuration is already set for interface $interface"
+    fi
+
+    # Check and update default gateway
+    target_gateway="192.168.16.1"
+    current_gateway=$(ip route show default | awk '/default via/ {print $3}')
+
+    if [ "$current_gateway" != "$target_gateway" ]; then
+        print_message "Updating default gateway..."
+        sudo ip route del default || print_error "Failed to delete existing default gateway"
+        sudo ip route add default via "$target_gateway" dev "$interface" || print_error "Failed to set default gateway"
+        print_message "Default gateway updated to $target_gateway"
+    else
+        print_message "Default gateway is already set to $target_gateway"
+    fi
+
+    # Check and update DNS configuration
+    target_dns="192.168.16.1"
+    current_dns=$(cat /etc/resolv.conf | awk '/nameserver/ {print $2}')
+
+    if [ "$current_dns" != "$target_dns" ]; then
+        print_message "Updating DNS configuration..."
+        sudo sed -i "s/nameserver .*/nameserver $target_dns/" /etc/resolv.conf || print_error "Failed to update DNS configuration"
+        print_message "DNS configuration updated to $target_dns"
+    else
+        print_message "DNS configuration is already set to $target_dns"
+    fi
+
+    # Check and update DNS search domains
+    target_domains="home.arpa localdomain"
+    current_domains=$(cat /etc/resolv.conf | awk '/search/ {print $2}')
+
+    if [ "$current_domains" != "$target_domains" ]; then
+        print_message "Updating DNS search domains..."
+        sudo sed -i "s/search .*/search $target_domains/" /etc/resolv.conf || print_error "Failed to update DNS search domains"
+        print_message "DNS search domains updated to $target_domains"
+    else
+        print_message "DNS search domains are already set to $target_domains"
+    fi
+}
+
+# Function to check and install required software
+install_software() {
+    print_message "Checking installed software..."
+
+    # Check and install SSH server
+    if ! is_package_installed "openssh-server"; then
+        print_message "Installing SSH server..."
+        sudo apt-get update || print_error "Failed to update package repositories"
+        sudo apt-get install -y openssh-server || print_error "Failed to install SSH server"
+        print_message "SSH server installed"
+    else
+        print_message "SSH server is already installed"
+    fi
+
+    # Check and configure SSH server
+    ssh_config="/etc/ssh/sshd_config"
+    if grep -q "^PasswordAuthentication no" "$ssh_config" && grep -q "^PubkeyAuthentication yes" "$ssh_config"; then
+        print_message "SSH server configuration is already set"
+    else
+        print_message "Configuring SSH server..."
+
+        sudo sed -i "/^PasswordAuthentication/s/.*/PasswordAuthentication no/" "$ssh_config" || print_error "Failed to update PasswordAuthentication"
+        sudo sed -i "/^PubkeyAuthentication/s/.*/PubkeyAuthentication yes/" "$ssh_config" || print_error "Failed to update PubkeyAuthentication"
+
+        # Enable only RSA and ED25519 key algorithms
+        sudo sed -i "/^HostKey .*ssh_host_ecdsa_key/d" "$ssh_config" || print_error "Failed to remove ECDSA key algorithm"
+        sudo sed -i "/^HostKey .*ssh_host_ed25519_key/d" "$ssh_config" || print_error "Failed to remove ED25519 key algorithm"
+
+        print_message "SSH server configured"
+    fi
+
+    # Check and install Apache2
+    if ! is_package_installed "apache2"; then
+        print_message "Installing Apache2..."
+        sudo apt-get update || print_error "Failed to update package repositories"
+        sudo apt-get install -y apache2 || print_error "Failed to install Apache2"
+        print_message "Apache2 installed"
+    else
+        print_message "Apache2 is already installed"
+    fi
+
+    # Check if Apache2 is listening on ports 80 and 443
+    if ! sudo lsof -i :80 &> /dev/null || ! sudo lsof -i :443 &> /dev/null; then
+        print_message "Configuring Apache2 ports..."
+
+        # Configure Apache2 to listen on ports 80 and 443
+        sudo sed -i "s/Listen 80/Listen 192.168.16.21:80/" /etc/apache2/ports.conf || print_error "Failed to update Apache2 port 80"
+        sudo sed -i "s/Listen 443/Listen 192.168.16.21:443/" /etc/apache2/ports.conf || print_error "Failed to update Apache2 port 443"
+
+        # Enable necessary modules
+        sudo a2enmod ssl || print_error "Failed to enable SSL module"
+        sudo a2enmod headers || print_error "Failed to enable headers module"
+
